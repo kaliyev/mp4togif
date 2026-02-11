@@ -17,3 +17,5 @@ tmp/
 
 # OS-specific files
 .DS_Store
+
+.junie/
