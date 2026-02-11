@@ -1,0 +1,19 @@
+# Environment variables
+.env
+
+# Go build artifacts
+mp4togif
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Temporary files and directories
+tmp/
+
+# IDE - IntelliJ IDEA
+.idea/
+
+# OS-specific files
+.DS_Store
