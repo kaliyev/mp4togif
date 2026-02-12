@@ -35,7 +35,6 @@ type cfg struct {
 }
 
 type ConvertRequest struct {
-	FilePath    string `json:"filepath"`
 	FPS         int    `json:"fps"`
 	Width       int    `json:"width"`
 	Start       int    `json:"start"`
@@ -90,7 +89,7 @@ func main() {
 			return
 		}
 
-		if req.FilePath == "" && req.S3InputKey == "" {
+		if req.S3InputKey == "" {
 			http.Error(w, "missing filepath or s3_input_key", http.StatusBadRequest)
 			return
 		}
@@ -103,23 +102,16 @@ func main() {
 		defer os.RemoveAll(tmpDir)
 
 		inMp4 := ""
-		if req.S3InputKey != "" {
-			if c.s3Client == nil {
-				http.Error(w, "s3 client not configured", http.StatusInternalServerError)
-				return
-			}
-			inMp4 = filepath.Join(tmpDir, "input.mp4")
-			err := c.s3Client.FGetObject(r.Context(), c.s3Bucket, req.S3InputKey, inMp4, minio.GetObjectOptions{})
-			if err != nil {
-				http.Error(w, "failed to download from s3: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-		} else {
-			inMp4 = filepath.Join(c.videosDir, req.FilePath)
-			if _, err := os.Stat(inMp4); err != nil {
-				http.Error(w, "video file not found", http.StatusNotFound)
-				return
-			}
+
+		if c.s3Client == nil {
+			http.Error(w, "s3 client not configured", http.StatusInternalServerError)
+			return
+		}
+		inMp4 = filepath.Join(tmpDir, "input.mp4")
+		err = c.s3Client.FGetObject(r.Context(), c.s3Bucket, req.S3InputKey, inMp4, minio.GetObjectOptions{})
+		if err != nil {
+			http.Error(w, "failed to download from s3: "+err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		// Read options from JSON
@@ -151,21 +143,15 @@ func main() {
 
 		pal := filepath.Join(tmpDir, "palette.png")
 		inBase := ""
-		if req.S3InputKey != "" {
-			inBase = filepath.Base(req.S3InputKey)
-		} else {
-			inBase = filepath.Base(req.FilePath)
-		}
+
+		inBase = filepath.Base(req.S3InputKey)
+
 		ext := filepath.Ext(inBase)
 		outName := inBase[:len(inBase)-len(ext)] + ".gif"
 		outGif := filepath.Join(tmpDir, outName)
 
 		sha := sha256.New()
-		if req.S3InputKey != "" {
-			sha.Write([]byte(req.S3InputKey))
-		} else {
-			sha.Write([]byte(req.FilePath))
-		}
+		sha.Write([]byte(req.S3InputKey))
 
 		// Run ffmpeg with timeout
 		ctx, cancel := context.WithTimeout(r.Context(), c.ffmpegTimeout)
@@ -200,7 +186,7 @@ func main() {
 		}
 
 		if _, err := os.Stat(outGif); err != nil {
-			http.Error(w, "video file not found", http.StatusNotFound)
+			http.Error(w, "gif video file not found", http.StatusNotFound)
 			return
 		}
 
