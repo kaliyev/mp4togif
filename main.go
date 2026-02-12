@@ -35,12 +35,11 @@ type cfg struct {
 }
 
 type ConvertRequest struct {
-	FPS         int    `json:"fps"`
-	Width       int    `json:"width"`
-	Start       int    `json:"start"`
-	Duration    int    `json:"duration"`
-	S3InputKey  string `json:"s3_input_key"`
-	S3OutputKey string `json:"s3_output_key"`
+	FPS        int    `json:"fps"`
+	Width      int    `json:"width"`
+	Start      int    `json:"start"`
+	Duration   int    `json:"duration"`
+	S3InputKey string `json:"s3_input_key"`
 }
 
 func main() {
@@ -190,26 +189,18 @@ func main() {
 			return
 		}
 
-		if req.S3OutputKey != "" {
-			_, err = c.s3Client.FPutObject(r.Context(), c.s3Bucket, req.S3OutputKey, outGif, minio.PutObjectOptions{
-				ContentType: "image/gif",
-			})
-			if err != nil {
-				http.Error(w, "failed to upload to s3: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-		} else {
-			finalPath := filepath.Join(c.videosDir, outName)
-			if err := os.Rename(outGif, finalPath); err != nil {
-				http.Error(w, "failed to move gif: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
+		_, err = c.s3Client.FPutObject(r.Context(), c.s3Bucket, outName, outGif, minio.PutObjectOptions{
+			ContentType: "image/gif",
+		})
+		if err != nil {
+			http.Error(w, "failed to upload to s3: "+err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		hash := hex.EncodeToString(sha.Sum(nil))[:12]
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"success":"ok","hash":"` + hash + `"}`))
+		_, _ = w.Write([]byte(`{"success":"ok","path":"` + outName + `","hash":"` + hash + `"}`))
 	})
 
 	s := &http.Server{
