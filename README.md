@@ -3,6 +3,7 @@
 A Go-based service that converts MP4 videos to high-quality GIFs using FFmpeg. It employs a two-pass encoding process with palette generation to ensure optimal visual quality.
 
 ## Features
+- Support for S3-compatible storage (MinIO) for input and output.
 - High-quality GIF conversion using FFmpeg `palettegen` and `paletteuse` filters.
 - Lanczos scaling for superior image resizing.
 - Configurable FPS, width, start time, and duration.
