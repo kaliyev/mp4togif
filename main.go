@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
@@ -73,7 +73,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 
-	// POST /convert : body=json -> response=gif bytes
+	// POST /convert: body=JSON -> response=GIF bytes
 	mux.HandleFunc("/convert", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -253,7 +253,7 @@ func runFFmpeg(ctx context.Context, args []string) error {
 		return fmt.Errorf("timeout")
 	}
 	if err != nil {
-		// include last ~2KB of output
+		// include the last ~2 KB of output
 		const max = 2048
 		s := string(out)
 		if len(s) > max {
