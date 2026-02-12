@@ -88,7 +88,16 @@ Converts an MP4 file to GIF.
 - `duration`: Duration in seconds. If omitted, defaults to 30s or the remaining length of the video.
 
 **Response:**
-Returns the filename of the generated GIF on success, or FFmpeg error output on failure.
+Returns a JSON object with `success`, `path` (the name of the GIF file in S3), and a short `hash` on success.
+
+### GET `/file?key=...`
+Downloads a file from the configured S3 bucket.
+
+**Query Parameters:**
+- `key`: The key of the file in the S3 bucket.
+
+**Response:**
+Returns the file contents with appropriate `Content-Type` and `Content-Disposition` headers.
 
 ## Development
 

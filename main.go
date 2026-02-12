@@ -203,6 +203,49 @@ func main() {
 		_, _ = w.Write([]byte(`{"success":"ok","path":"` + outName + `","hash":"` + hash + `"}`))
 	})
 
+	// GET /file?key=...: downloads file from s3
+	mux.HandleFunc("/file", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, "missing key parameter", http.StatusBadRequest)
+			return
+		}
+
+		if c.s3Client == nil {
+			http.Error(w, "s3 client not configured", http.StatusInternalServerError)
+			return
+		}
+
+		obj, err := c.s3Client.GetObject(r.Context(), c.s3Bucket, key, minio.GetObjectOptions{})
+		if err != nil {
+			http.Error(w, "failed to get object from s3: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer obj.Close()
+
+		info, err := obj.Stat()
+		if err != nil {
+			// Check if object exists
+			if errResp, ok := err.(minio.ErrorResponse); ok && errResp.Code == "NoSuchKey" {
+				http.Error(w, "file not found", http.StatusNotFound)
+			} else {
+				http.Error(w, "failed to stat object: "+err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		w.Header().Set("Content-Type", info.ContentType)
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(key)))
+
+		http.ServeContent(w, r, filepath.Base(key), info.LastModified, obj)
+	})
+
 	s := &http.Server{
 		Addr:              c.addr,
 		Handler:           logMiddleware(mux),
