@@ -15,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 type cfg struct {
@@ -22,14 +25,23 @@ type cfg struct {
 	maxBodyBytes  int64
 	ffmpegTimeout time.Duration
 	videosDir     string
+
+	s3Endpoint  string
+	s3AccessKey string
+	s3SecretKey string
+	s3Bucket    string
+	s3UseSSL    bool
+	s3Client    *minio.Client
 }
 
 type ConvertRequest struct {
-	FilePath string `json:"filepath"`
-	FPS      int    `json:"fps"`
-	Width    int    `json:"width"`
-	Start    int    `json:"start"`
-	Duration int    `json:"duration"`
+	FilePath    string `json:"filepath"`
+	FPS         int    `json:"fps"`
+	Width       int    `json:"width"`
+	Start       int    `json:"start"`
+	Duration    int    `json:"duration"`
+	S3InputKey  string `json:"s3_input_key"`
+	S3OutputKey string `json:"s3_output_key"`
 }
 
 func main() {
@@ -38,6 +50,24 @@ func main() {
 		maxBodyBytes:  envInt64("MAX_BODY_BYTES", 200*1024*1024), // 200MB
 		ffmpegTimeout: envDur("FFMPEG_TIMEOUT", 2*time.Minute),
 		videosDir:     env("VIDEOS_DIR", "tmp/videos/"),
+
+		s3Endpoint:  env("S3_ENDPOINT", ""),
+		s3AccessKey: env("S3_ACCESS_KEY", ""),
+		s3SecretKey: env("S3_SECRET_KEY", ""),
+		s3Bucket:    env("S3_BUCKET", "videos"),
+		s3UseSSL:    env("S3_USE_SSL", "false") == "true",
+	}
+
+	if c.s3Endpoint != "" {
+		minioClient, err := minio.New(c.s3Endpoint, &minio.Options{
+			Creds:  credentials.NewStaticV4(c.s3AccessKey, c.s3SecretKey, ""),
+			Secure: c.s3UseSSL,
+		})
+		if err != nil {
+			log.Fatalf("failed to initialize s3 client: %v", err)
+		}
+		c.s3Client = minioClient
+		log.Printf("s3 client initialized for %s", c.s3Endpoint)
 	}
 
 	mux := http.NewServeMux()
@@ -60,15 +90,36 @@ func main() {
 			return
 		}
 
-		if req.FilePath == "" {
-			http.Error(w, "missing filepath", http.StatusBadRequest)
+		if req.FilePath == "" && req.S3InputKey == "" {
+			http.Error(w, "missing filepath or s3_input_key", http.StatusBadRequest)
 			return
 		}
 
-		inMp4 := filepath.Join(c.videosDir, req.FilePath)
-		if _, err := os.Stat(inMp4); err != nil {
-			http.Error(w, "video file not found", http.StatusNotFound)
+		tmpDir, err := os.MkdirTemp("", "mp4gif-*")
+		if err != nil {
+			http.Error(w, "tmp dir error", http.StatusInternalServerError)
 			return
+		}
+		defer os.RemoveAll(tmpDir)
+
+		inMp4 := ""
+		if req.S3InputKey != "" {
+			if c.s3Client == nil {
+				http.Error(w, "s3 client not configured", http.StatusInternalServerError)
+				return
+			}
+			inMp4 = filepath.Join(tmpDir, "input.mp4")
+			err := c.s3Client.FGetObject(r.Context(), c.s3Bucket, req.S3InputKey, inMp4, minio.GetObjectOptions{})
+			if err != nil {
+				http.Error(w, "failed to download from s3: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			inMp4 = filepath.Join(c.videosDir, req.FilePath)
+			if _, err := os.Stat(inMp4); err != nil {
+				http.Error(w, "video file not found", http.StatusNotFound)
+				return
+			}
 		}
 
 		// Read options from JSON
@@ -98,23 +149,21 @@ func main() {
 			}
 		}
 
-		tmpDir, err := os.MkdirTemp("", "mp4gif-*")
-		if err != nil {
-			http.Error(w, "tmp dir error", http.StatusInternalServerError)
-			return
-		}
-		defer os.RemoveAll(tmpDir)
-
 		pal := filepath.Join(tmpDir, "palette.png")
-		inBase := filepath.Base(req.FilePath)
+		inBase := ""
+		if req.S3InputKey != "" {
+			inBase = filepath.Base(req.S3InputKey)
+		} else {
+			inBase = filepath.Base(req.FilePath)
+		}
 		ext := filepath.Ext(inBase)
 		outName := inBase[:len(inBase)-len(ext)] + ".gif"
 		outGif := filepath.Join(tmpDir, outName)
 
 		sha := sha256.New()
-		if _, err := os.Stat(inMp4); err == nil {
-			// Read a bit of the file to get a hash for the filename hint, or just use the name
-			// To be efficient, we can hash the filepath and file info
+		if req.S3InputKey != "" {
+			sha.Write([]byte(req.S3InputKey))
+		} else {
 			sha.Write([]byte(req.FilePath))
 		}
 
@@ -155,10 +204,20 @@ func main() {
 			return
 		}
 
-		finalPath := filepath.Join(c.videosDir, outName)
-		if err := os.Rename(outGif, finalPath); err != nil {
-			http.Error(w, "failed to move gif: "+err.Error(), http.StatusInternalServerError)
-			return
+		if req.S3OutputKey != "" {
+			_, err = c.s3Client.FPutObject(r.Context(), c.s3Bucket, req.S3OutputKey, outGif, minio.PutObjectOptions{
+				ContentType: "image/gif",
+			})
+			if err != nil {
+				http.Error(w, "failed to upload to s3: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			finalPath := filepath.Join(c.videosDir, outName)
+			if err := os.Rename(outGif, finalPath); err != nil {
+				http.Error(w, "failed to move gif: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 
 		hash := hex.EncodeToString(sha.Sum(nil))[:12]

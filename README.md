@@ -31,6 +31,11 @@ The application is configured via environment variables:
 | `VIDEOS_DIR` | Directory containing source videos and where GIFs are saved | `tmp/videos/` |
 | `MAX_BODY_BYTES` | Maximum allowed request body size | `209715200` (200MB) |
 | `FFMPEG_TIMEOUT` | Maximum time allowed for FFmpeg conversion | `2m` |
+| `S3_ENDPOINT` | S3 endpoint (e.g., `localhost:9000`) | (empty) |
+| `S3_ACCESS_KEY` | S3 access key | (empty) |
+| `S3_SECRET_KEY` | S3 secret key | (empty) |
+| `S3_BUCKET` | S3 bucket name | `videos` |
+| `S3_USE_SSL` | Use SSL for S3 | `false` |
 
 ## Setup and Run
 
@@ -68,10 +73,14 @@ Converts an MP4 file to GIF.
   "fps": 10,
   "width": 480,
   "start": 0,
-  "duration": 30
+  "duration": 30,
+  "s3_input_key": "raw/input.mp4",
+  "s3_output_key": "processed/output.gif"
 }
 ```
-- `filepath`: (Required) Relative path to the file inside `VIDEOS_DIR`.
+- `filepath`: Relative path to the file inside `VIDEOS_DIR` (used if `s3_input_key` is empty).
+- `s3_input_key`: (Optional) Key of the source file in S3.
+- `s3_output_key`: (Optional) Key where the resulting GIF will be uploaded in S3.
 - `fps`: Frames per second (1-30, default: 10).
 - `width`: GIF width (64-1920, default: 480).
 - `start`: Start time in seconds (default: 0).
