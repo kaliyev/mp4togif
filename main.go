@@ -140,14 +140,13 @@ func main() {
 			}
 		}
 
-		pal := filepath.Join(tmpDir, "palette.png")
 		inBase := ""
 
 		inBase = filepath.Base(req.S3InputKey)
 
 		ext := filepath.Ext(inBase)
-		outName := inBase[:len(inBase)-len(ext)] + ".gif"
-		outGif := filepath.Join(tmpDir, outName)
+		outName := inBase[:len(inBase)-len(ext)] + "_converted.mp4"
+		outMp4 := filepath.Join(tmpDir, outName)
 
 		sha := sha256.New()
 		sha.Write([]byte(req.S3InputKey))
@@ -156,41 +155,30 @@ func main() {
 		ctx, cancel := context.WithTimeout(r.Context(), c.ffmpegTimeout)
 		defer cancel()
 
-		filterPalette := fmt.Sprintf("fps=%d,scale=%d:-1:flags=lanczos,palettegen=stats_mode=diff", fps, width)
-		filterGif := fmt.Sprintf("fps=%d,scale=%d:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=1:diff_mode=rectangle", fps, width)
-
 		// Build common args (optional trim)
-		common := []string{}
+		args := []string{"-y"}
 		if start > 0 {
-			common = append(common, "-ss", fmt.Sprintf("%.3f", start))
+			args = append(args, "-ss", fmt.Sprintf("%.3f", start))
 		}
 		if dur > 0 {
-			common = append(common, "-t", fmt.Sprintf("%.3f", dur))
+			args = append(args, "-t", fmt.Sprintf("%.3f", dur))
 		}
 
-		// 1) palette
-		args1 := append([]string{"-y"}, common...)
-		args1 = append(args1, "-i", inMp4, "-vf", filterPalette, pal)
-		if err := runFFmpeg(ctx, args1); err != nil {
-			http.Error(w, "ffmpeg palette error: "+err.Error(), http.StatusUnprocessableEntity)
+		// Input and encoding parameters
+		args = append(args, "-i", inMp4, "-r", fmt.Sprintf("%d", fps), "-preset", "medium", "-crf", "28", "-vf", fmt.Sprintf("scale=%d:-1:flags=lanczos", width), outMp4)
+
+		if err := runFFmpeg(ctx, args); err != nil {
+			http.Error(w, "ffmpeg error: "+err.Error(), http.StatusUnprocessableEntity)
 			return
 		}
 
-		// 2) gif
-		args2 := append([]string{"-y"}, common...)
-		args2 = append(args2, "-i", inMp4, "-i", pal, "-lavfi", filterGif, outGif)
-		if err := runFFmpeg(ctx, args2); err != nil {
-			http.Error(w, "ffmpeg gif error: "+err.Error(), http.StatusUnprocessableEntity)
+		if _, err := os.Stat(outMp4); err != nil {
+			http.Error(w, "mp4 video file not found", http.StatusNotFound)
 			return
 		}
 
-		if _, err := os.Stat(outGif); err != nil {
-			http.Error(w, "gif video file not found", http.StatusNotFound)
-			return
-		}
-
-		_, err = c.s3Client.FPutObject(r.Context(), c.s3Bucket, outName, outGif, minio.PutObjectOptions{
-			ContentType: "image/gif",
+		_, err = c.s3Client.FPutObject(r.Context(), c.s3Bucket, outName, outMp4, minio.PutObjectOptions{
+			ContentType: "video/mp4",
 		})
 		if err != nil {
 			http.Error(w, "failed to upload to s3: "+err.Error(), http.StatusInternalServerError)
