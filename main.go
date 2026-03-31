@@ -115,7 +115,6 @@ func main() {
 
 		// Read options from JSON
 		fps := clampInt(cmp.Or(req.FPS, 10), 1, 30)
-		width := clampInt(cmp.Or(req.Width, 480), 64, 1920)
 
 		// Get video duration to calculate middle 30 seconds if needed
 		totalDur, err := getVideoDuration(r.Context(), inMp4)
@@ -165,7 +164,7 @@ func main() {
 		}
 
 		// Input and encoding parameters
-		args = append(args, "-i", inMp4, "-r", fmt.Sprintf("%d", fps), "-preset", "medium", "-crf", "28", "-vf", fmt.Sprintf("scale=%d:-1:flags=lanczos", width), outMp4)
+		args = append(args, "-i", inMp4, "-r", fmt.Sprintf("%d", fps), "-preset", "medium", "-crf", "28", outMp4)
 
 		if err := runFFmpeg(ctx, args); err != nil {
 			http.Error(w, "ffmpeg error: "+err.Error(), http.StatusUnprocessableEntity)
