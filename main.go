@@ -39,7 +39,6 @@ type cfg struct {
 	ingestPaths     []string
 	ingestUser      string
 	ingestPassword  string
-	ingestJSONField string
 	ingestWorkers   int
 	ingestQueueSize int
 
@@ -68,7 +67,6 @@ func main() {
 		ingestPaths:     envList("INGEST_PATH", "/incidents"),
 		ingestUser:      env("INGEST_USER", ""),
 		ingestPassword:  env("INGEST_PASSWORD", ""),
-		ingestJSONField: env("INGEST_JSON_FIELD", "data"),
 		ingestWorkers:   int(max(envInt64("INGEST_WORKERS", 2), 1)),
 		ingestQueueSize: int(max(envInt64("INGEST_QUEUE_SIZE", 100), 0)),
 

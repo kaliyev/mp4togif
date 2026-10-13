@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -62,7 +61,7 @@ func newIncidents(c *cfg, db *pgxpool.Pool, tg *telegram) *incidents {
 	}
 }
 
-// POST <INGEST_PATH>: multipart with incident JSON and a "video" file.
+// POST <INGEST_PATH>: multipart form with incident fields and a "video" file.
 // Stores the original in S3, inserts a core_incident row, responds, then converts and notifies in the background.
 func (s *incidents) handle(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -107,15 +106,10 @@ func (s *incidents) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, data, err := s.incidentBody(form.fields)
-	if err != nil {
-		writeResult(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
+	body := form.fields
 	var missing []string
 	for _, k := range incidentRequired {
-		if isBlank(body[k]) {
+		if strings.TrimSpace(body[k]) == "" {
 			missing = append(missing, k)
 		}
 	}
@@ -138,7 +132,7 @@ func (s *incidents) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.insert(ctx, id, body, data, key); err != nil {
+	if err := s.insert(ctx, id, body, key); err != nil {
 		log.Printf("incident %s: insert: %v", id, err)
 		if err := s.c.s3Client.RemoveObject(context.WithoutCancel(ctx), s.c.s3Bucket, key, minio.RemoveObjectOptions{}); err != nil {
 			log.Printf("incident %s: remove orphaned %s: %v", id, key, err)
@@ -247,45 +241,26 @@ func saveTo(path string, src io.Reader) error {
 	return f.Close()
 }
 
-// incidentBody returns the incident fields and the JSON stored in core_incident.data.
-// The JSON comes from the INGEST_JSON_FIELD part; without it, the plain form fields are used, as n8n did.
-func (s *incidents) incidentBody(fields map[string]string) (map[string]any, []byte, error) {
-	if raw, ok := fields[s.c.ingestJSONField]; ok {
-		dec := json.NewDecoder(strings.NewReader(raw))
-		dec.UseNumber()
-		var body map[string]any
-		if err := dec.Decode(&body); err != nil || body == nil {
-			return nil, nil, fmt.Errorf("field %q must be a JSON object", s.c.ingestJSONField)
-		}
-		var compact bytes.Buffer
-		if err := json.Compact(&compact, []byte(raw)); err != nil {
-			return nil, nil, fmt.Errorf("field %q must be a JSON object", s.c.ingestJSONField)
-		}
-		return body, compact.Bytes(), nil
-	}
-	body := make(map[string]any, len(fields))
-	for k, v := range fields {
-		body[k] = v
-	}
+// insert stores the form fields as core_incident.data, like the n8n query did.
+func (s *incidents) insert(ctx context.Context, id string, body map[string]string, key string) error {
 	data, err := json.Marshal(body)
-	return body, data, err
-}
-
-func (s *incidents) insert(ctx context.Context, id string, body map[string]any, data []byte, key string) error {
+	if err != nil {
+		return err
+	}
 	// date arrives as DD.MM.YYYY; Postgres parses "YYYY-MM-DD <time>" in the session time zone, same as the n8n query.
-	parts := strings.Split(str(body["date"]), ".")
+	parts := strings.Split(body["date"], ".")
 	slices.Reverse(parts)
-	datetime := strings.Join(parts, "-") + " " + str(body["time"])
+	datetime := strings.Join(parts, "-") + " " + body["time"]
 
-	_, err := s.db.Exec(ctx, `
+	_, err = s.db.Exec(ctx, `
 		INSERT INTO core_incident (id, location, datetime, data, video, school_id, created_at)
 		VALUES ($1::text::uuid, $2, $3::text::timestamptz, $4::text::jsonb, $5, $6::text::uuid, now())`,
-		id, str(body["location"]), datetime, string(data), key, s.c.schoolID)
+		id, body["location"], datetime, string(data), key, s.c.schoolID)
 	return err
 }
 
-func (s *incidents) message(body map[string]any) string {
-	f := func(k string) string { return html.EscapeString(str(body[k])) }
+func (s *incidents) message(body map[string]string) string {
+	f := func(k string) string { return html.EscapeString(body[k]) }
 	return fmt.Sprintf("%s\nКлассификация: <b>%s</b>\n\nМесто: <b>%s</b>\nОписание: <i>%s</i>\nПроцент уверенности: %s\nОценка буллинга: %s\nОценка драки: %s\nДата: %s - %s",
 		html.EscapeString(s.c.telegramHeader),
 		f("classification"), f("location"), f("description"),
@@ -364,26 +339,4 @@ func writeResult(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"result": "error", "message": message})
-}
-
-func isBlank(v any) bool {
-	if v == nil {
-		return true
-	}
-	s, ok := v.(string)
-	return ok && strings.TrimSpace(s) == ""
-}
-
-func str(v any) string {
-	switch v := v.(type) {
-	case nil:
-		return ""
-	case string:
-		return v
-	case json.Number:
-		return v.String()
-	default:
-		b, _ := json.Marshal(v)
-		return string(b)
-	}
 }

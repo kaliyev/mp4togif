@@ -54,7 +54,6 @@ Environment variables:
 | `SCHOOL_ID` | UUID written to `core_incident.school_id`. **Required** for `/incidents` | (empty) |
 | `INGEST_PATH` | Path(s) of the ingest endpoint, comma-separated, e.g. `/incidents,/webhook/<n8n-id>` to keep the old n8n webhook path during migration | `/incidents` |
 | `INGEST_USER` / `INGEST_PASSWORD` | Basic auth credentials for the ingest endpoint. **Required** for `/incidents` | (empty) |
-| `INGEST_JSON_FIELD` | Multipart field that carries the incident JSON | `data` |
 | `INGEST_WORKERS` | Number of conversions running in parallel | `2` |
 | `INGEST_QUEUE_SIZE` | Conversions waiting for a worker; when full, ingest requests wait | `100` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Telegram notifications; disabled if either is empty | (empty) |
@@ -89,15 +88,14 @@ Returns `200 OK`.
 ### `POST /incidents`
 Accepts an incident from a camera/analytics client. Requires basic auth (`INGEST_USER` / `INGEST_PASSWORD`).
 
-**Request:** `multipart/form-data` with
-- `video`: the video file;
-- `data` (name set by `INGEST_JSON_FIELD`): a JSON object with the incident. If this field is absent, all other text fields of the form are used as the incident instead (string values).
+**Request:** `multipart/form-data` with the video file in `video` and the incident as text fields.
 
-Required incident fields: `location`, `date` (`DD.MM.YYYY`), `time` (e.g. `08:15:00`). Fields used in the Telegram message: `classification`, `description`, `confidence_percentage`, `bullying_score`, `fight_score`. The whole object is stored as-is in `core_incident.data`.
+Required fields: `location`, `date` (`DD.MM.YYYY`), `time` (e.g. `08:15:00`). Fields used in the Telegram message: `classification`, `description`, `confidence_percentage`, `bullying_score`, `fight_score`. All text fields are stored in `core_incident.data` as a JSON object of strings, as n8n did.
 
 ```bash
 curl -u cam:secret \
-  -F 'data={"location":"Corridor 2","date":"13.10.2026","time":"08:15:00","classification":"fight","fight_score":0.9}' \
+  -F location='Corridor 2' -F date=13.10.2026 -F time=08:15:00 \
+  -F classification=fight -F fight_score=0.9 \
   -F 'video=@clip.mp4;type=video/mp4' \
   http://localhost:8180/incidents
 ```
@@ -110,7 +108,7 @@ curl -u cam:secret \
 
 **Responses:**
 - `200 {"result":"success","id":"<uuid>"}`
-- `400 {"result":"error","message":"fields missing: location, video"}`, or invalid JSON / not multipart
+- `400 {"result":"error","message":"fields missing: location, video"}`, or not multipart
 - `401` wrong or missing credentials
 - `413` body larger than `MAX_BODY_BYTES`
 - `500 {"result":"error","message":"something wrong"}`: S3 upload or DB insert failed (details in the log), including an unparseable `date`/`time`
