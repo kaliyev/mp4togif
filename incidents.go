@@ -68,9 +68,9 @@ func (s *incidents) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.authorized(r) {
+	if reason := s.authError(r); reason != "" {
 		w.Header().Set("WWW-Authenticate", `Basic realm="incidents"`)
-		writeResult(w, http.StatusUnauthorized, "unauthorized")
+		writeResult(w, http.StatusUnauthorized, reason)
 		return
 	}
 	if s.c.s3Client == nil {
@@ -165,14 +165,18 @@ func (s *incidents) handle(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"result": "success", "id": id})
 }
 
-func (s *incidents) authorized(r *http.Request) bool {
+// authError checks basic auth and returns why it failed, or "" when the request is authorized.
+func (s *incidents) authError(r *http.Request) string {
 	user, pass, ok := r.BasicAuth()
 	if !ok {
-		return false
+		return "missing credentials"
 	}
 	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(s.c.ingestUser)) == 1
 	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(s.c.ingestPassword)) == 1
-	return userOK && passOK
+	if !userOK || !passOK {
+		return "invalid credentials"
+	}
+	return ""
 }
 
 type incidentForm struct {

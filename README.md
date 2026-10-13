@@ -166,7 +166,9 @@ Each request works in its own temp directory (`os.MkdirTemp`). For `/convert` it
 
 ### Go idioms used
 - `cmp.Or` for defaults, `context.WithTimeout` for the FFmpeg process, `http.NewServeMux` for routing, `http.MaxBytesReader` for body limits.
-- A logging middleware prints method, path and elapsed time per request.
+- Logs go to stderr (`docker logs`). One line per request: method, path, status, duration, client address (`xff=` when `X-Forwarded-For` is set), and for 4xx/5xx the start of the response body, which carries the reason, e.g.
+  `POST /incidents 400 287µs 10.0.0.5:51328: {"message":"fields missing: date","result":"error"}`.
+  Ingest also logs each stored incident, conversion results, and S3/DB/FFmpeg/Telegram failures with the incident id.
 
 ### Known gaps
 - No tests; CI only runs `go build`.

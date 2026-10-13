@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -212,13 +213,52 @@ func (c *cfg) handleFile(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, filepath.Base(key), info.LastModified, obj)
 }
 
+// logMiddleware logs one line per request: method, path, status, duration, client address,
+// and for 4xx/5xx the start of the response body, which carries the reason.
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+
+		line := fmt.Sprintf("%s %s %d %s %s", r.Method, r.URL.Path, cmp.Or(rec.status, http.StatusOK), time.Since(start).Round(time.Microsecond), r.RemoteAddr)
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			line += " xff=" + xff
+		}
+		if len(rec.body) > 0 {
+			line += ": " + strings.Join(strings.Fields(string(rec.body)), " ")
+		}
+		log.Print(line)
 	})
 }
+
+const maxLoggedBody = 300
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	body   []byte // start of an error response body
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	if r.status >= 400 && len(r.body) < maxLoggedBody {
+		r.body = append(r.body, b[:min(len(b), maxLoggedBody-len(r.body))]...)
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
