@@ -30,7 +30,7 @@ var incidentConvert = convertOpts{FPS: 5, Start: 0, Duration: 30}
 
 const (
 	incidentVideoField = "video"
-	maxTextFieldBytes  = 1 << 20
+	maxFormTextBytes   = 1 << 20 // all text fields together; the video goes to disk
 )
 
 type incidentJob struct {
@@ -194,6 +194,7 @@ func readIncidentForm(r *http.Request, tmpDir string) (*incidentForm, error) {
 		return nil, errors.New("expected multipart/form-data")
 	}
 	form := &incidentForm{fields: map[string]string{}}
+	textLeft := int64(maxFormTextBytes)
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -222,12 +223,13 @@ func readIncidentForm(r *http.Request, tmpDir string) (*incidentForm, error) {
 			}
 			continue
 		}
-		b, err := io.ReadAll(io.LimitReader(part, maxTextFieldBytes+1))
+		b, err := io.ReadAll(io.LimitReader(part, textLeft+1))
 		if err != nil {
 			return nil, err
 		}
-		if len(b) > maxTextFieldBytes {
-			return nil, fmt.Errorf("field %q too large", name)
+		textLeft -= int64(len(b))
+		if textLeft < 0 {
+			return nil, errors.New("form fields too large")
 		}
 		form.fields[name] = string(b)
 	}
