@@ -3,8 +3,8 @@ FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY main.go ./
-RUN CGO_ENABLED=0 go build -o /out/mp4togif main.go
+COPY *.go ./
+RUN CGO_ENABLED=0 go build -o /out/mp4togif .
 
 # runtime
 FROM alpine:3.20

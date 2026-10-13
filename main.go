@@ -1,30 +1,31 @@
 package main
 
 import (
-	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 type cfg struct {
-	addr          string
-	maxBodyBytes  int64
-	ffmpegTimeout time.Duration
-	videosDir     string
+	addr            string
+	maxBodyBytes    int64
+	ffmpegTimeout   time.Duration
+	shutdownTimeout time.Duration
+	videosDir       string
 
 	s3Endpoint  string
 	s3AccessKey string
@@ -32,28 +33,49 @@ type cfg struct {
 	s3Bucket    string
 	s3UseSSL    bool
 	s3Client    *minio.Client
-}
 
-type ConvertRequest struct {
-	FPS        int    `json:"fps"`
-	Width      int    `json:"width"`
-	Start      int    `json:"start"`
-	Duration   int    `json:"duration"`
-	S3InputKey string `json:"s3_input_key"`
+	databaseURL     string
+	schoolID        string
+	ingestPaths     []string
+	ingestUser      string
+	ingestPassword  string
+	ingestJSONField string
+	ingestWorkers   int
+	ingestQueueSize int
+
+	telegramAPI    string
+	telegramToken  string
+	telegramChatID string
+	telegramHeader string
 }
 
 func main() {
 	c := cfg{
-		addr:          env("ADDR", ":8180"),
-		maxBodyBytes:  envInt64("MAX_BODY_BYTES", 200*1024*1024), // 200MB
-		ffmpegTimeout: envDur("FFMPEG_TIMEOUT", 2*time.Minute),
-		videosDir:     env("VIDEOS_DIR", "tmp/videos/"),
+		addr:            env("ADDR", ":8180"),
+		maxBodyBytes:    envInt64("MAX_BODY_BYTES", 200*1024*1024), // 200MB
+		ffmpegTimeout:   envDur("FFMPEG_TIMEOUT", 2*time.Minute),
+		shutdownTimeout: envDur("SHUTDOWN_TIMEOUT", 25*time.Second),
+		videosDir:       env("VIDEOS_DIR", "tmp/videos/"),
 
 		s3Endpoint:  env("S3_ENDPOINT", ""),
 		s3AccessKey: env("S3_ACCESS_KEY", ""),
 		s3SecretKey: env("S3_SECRET_KEY", ""),
 		s3Bucket:    env("S3_BUCKET", "videos"),
 		s3UseSSL:    env("S3_USE_SSL", "false") == "true",
+
+		databaseURL:     env("DATABASE_URL", ""),
+		schoolID:        env("SCHOOL_ID", ""),
+		ingestPaths:     envList("INGEST_PATH", "/incidents"),
+		ingestUser:      env("INGEST_USER", ""),
+		ingestPassword:  env("INGEST_PASSWORD", ""),
+		ingestJSONField: env("INGEST_JSON_FIELD", "data"),
+		ingestWorkers:   int(max(envInt64("INGEST_WORKERS", 2), 1)),
+		ingestQueueSize: int(max(envInt64("INGEST_QUEUE_SIZE", 100), 0)),
+
+		telegramAPI:    env("TELEGRAM_API_URL", "https://api.telegram.org"),
+		telegramToken:  env("TELEGRAM_BOT_TOKEN", ""),
+		telegramChatID: env("TELEGRAM_CHAT_ID", ""),
+		telegramHeader: env("TELEGRAM_HEADER", "Что-то произошло в школе"),
 	}
 
 	if c.s3Endpoint != "" {
@@ -68,170 +90,40 @@ func main() {
 		log.Printf("s3 client initialized for %s", c.s3Endpoint)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/convert", c.handleConvert)
+	mux.HandleFunc("/file", c.handleFile)
 
-	// POST /convert: body=JSON -> response=GIF bytes
-	mux.HandleFunc("/convert", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Limit request size
-		r.Body = http.MaxBytesReader(w, r.Body, c.maxBodyBytes)
-		defer r.Body.Close()
-
-		var req ConvertRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid json", http.StatusBadRequest)
-			return
-		}
-
-		if req.S3InputKey == "" {
-			http.Error(w, "missing filepath or s3_input_key", http.StatusBadRequest)
-			return
-		}
-
-		tmpDir, err := os.MkdirTemp("", "mp4gif-*")
+	var inc *incidents
+	if err := c.ingestConfigError(); err != nil {
+		log.Printf("incident ingest disabled: %v", err)
+	} else {
+		db, err := pgxpool.New(ctx, c.databaseURL)
 		if err != nil {
-			http.Error(w, "tmp dir error", http.StatusInternalServerError)
-			return
+			log.Fatalf("invalid DATABASE_URL: %v", err)
 		}
-		defer os.RemoveAll(tmpDir)
-
-		inMp4 := ""
-
-		if c.s3Client == nil {
-			http.Error(w, "s3 client not configured", http.StatusInternalServerError)
-			return
+		defer db.Close()
+		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := db.Ping(pingCtx); err != nil {
+			log.Printf("warning: database not reachable yet: %v", err)
 		}
-		inMp4 = filepath.Join(tmpDir, "input.mp4")
-		err = c.s3Client.FGetObject(r.Context(), c.s3Bucket, req.S3InputKey, inMp4, minio.GetObjectOptions{})
-		if err != nil {
-			http.Error(w, "failed to download from s3: "+err.Error(), http.StatusInternalServerError)
-			return
+		cancel()
+
+		tg := newTelegram(c.telegramAPI, c.telegramToken, c.telegramChatID)
+		if !tg.enabled() {
+			log.Printf("telegram notifications disabled: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
 		}
-
-		// Read options from JSON
-		fps := clampInt(cmp.Or(req.FPS, 10), 1, 30)
-
-		// Get video duration to calculate middle 30 seconds if needed
-		totalDur, err := getVideoDuration(r.Context(), inMp4)
-		if err != nil {
-			log.Printf("failed to get duration for %s: %v", inMp4, err)
+		inc = newIncidents(&c, db, tg)
+		inc.run()
+		for _, p := range c.ingestPaths {
+			mux.HandleFunc(p, inc.handle)
 		}
-
-		// Logical cut (seconds)
-		var start, dur float64
-		if req.Duration > 0 {
-			start = float64(req.Start)
-			dur = float64(req.Duration)
-		} else {
-			// Default to 30 seconds from the middle
-			const target = 30.0
-			if totalDur > target {
-				start = (totalDur - target) / 2
-				dur = target
-			} else {
-				start = 0
-				dur = totalDur
-			}
-		}
-
-		inBase := ""
-
-		inBase = filepath.Base(req.S3InputKey)
-
-		ext := filepath.Ext(inBase)
-		outName := inBase[:len(inBase)-len(ext)] + "_converted.mp4"
-		outMp4 := filepath.Join(tmpDir, outName)
-
-		sha := sha256.New()
-		sha.Write([]byte(req.S3InputKey))
-
-		// Run ffmpeg with timeout
-		ctx, cancel := context.WithTimeout(r.Context(), c.ffmpegTimeout)
-		defer cancel()
-
-		// Build common args (optional trim)
-		args := []string{"-y"}
-		if start > 0 {
-			args = append(args, "-ss", fmt.Sprintf("%.3f", start))
-		}
-		if dur > 0 {
-			args = append(args, "-t", fmt.Sprintf("%.3f", dur))
-		}
-
-		// Input and encoding parameters
-		args = append(args, "-i", inMp4, "-r", fmt.Sprintf("%d", fps), "-preset", "medium", "-crf", "28", outMp4)
-
-		if err := runFFmpeg(ctx, args); err != nil {
-			http.Error(w, "ffmpeg error: "+err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-
-		if _, err := os.Stat(outMp4); err != nil {
-			http.Error(w, "mp4 video file not found", http.StatusNotFound)
-			return
-		}
-
-		_, err = c.s3Client.FPutObject(r.Context(), c.s3Bucket, outName, outMp4, minio.PutObjectOptions{
-			ContentType: "video/mp4",
-		})
-		if err != nil {
-			http.Error(w, "failed to upload to s3: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		hash := hex.EncodeToString(sha.Sum(nil))[:12]
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"success":"ok","path":"` + outName + `","hash":"` + hash + `"}`))
-	})
-
-	// GET /file?key=...: downloads file from s3
-	mux.HandleFunc("/file", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		key := r.URL.Query().Get("key")
-		if key == "" {
-			http.Error(w, "missing key parameter", http.StatusBadRequest)
-			return
-		}
-
-		if c.s3Client == nil {
-			http.Error(w, "s3 client not configured", http.StatusInternalServerError)
-			return
-		}
-
-		obj, err := c.s3Client.GetObject(r.Context(), c.s3Bucket, key, minio.GetObjectOptions{})
-		if err != nil {
-			http.Error(w, "failed to get object from s3: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer obj.Close()
-
-		info, err := obj.Stat()
-		if err != nil {
-			// Check if object exists
-			if errResp, ok := err.(minio.ErrorResponse); ok && errResp.Code == "NoSuchKey" {
-				http.Error(w, "file not found", http.StatusNotFound)
-			} else {
-				http.Error(w, "failed to stat object: "+err.Error(), http.StatusInternalServerError)
-			}
-			return
-		}
-
-		w.Header().Set("Content-Type", info.ContentType)
-		w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(key)))
-
-		http.ServeContent(w, r, filepath.Base(key), info.LastModified, obj)
-	})
+		log.Printf("incident ingest on %s (%d workers)", strings.Join(c.ingestPaths, ", "), c.ingestWorkers)
+	}
 
 	s := &http.Server{
 		Addr:              c.addr,
@@ -239,36 +131,87 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("converter listening on %s", c.addr)
-	log.Fatal(s.ListenAndServe())
-}
-
-func getVideoDuration(ctx context.Context, path string) (float64, error) {
-	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
-	out, err := cmd.Output()
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
-}
-
-func runFFmpeg(ctx context.Context, args []string) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	// Keep logs for debugging but not too noisy; you can redirect to /dev/null if you want.
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("timeout")
-	}
-	if err != nil {
-		// include the last ~2 KB of output
-		const max = 2048
-		s := string(out)
-		if len(s) > max {
-			s = s[len(s)-max:]
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		log.Printf("shutting down")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), c.shutdownTimeout)
+		defer cancel()
+		if err := s.Shutdown(shutdownCtx); err != nil {
+			log.Printf("http shutdown: %v", err)
 		}
-		return fmt.Errorf("%v; ffmpeg: %s", err, s)
+		if inc != nil {
+			inc.shutdown(shutdownCtx)
+		}
+	}()
+
+	log.Printf("converter listening on %s", c.addr)
+	if err := s.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
+	<-shutdownDone
+}
+
+func (c *cfg) ingestConfigError() error {
+	var missing []string
+	for name, v := range map[string]string{
+		"DATABASE_URL": c.databaseURL, "SCHOOL_ID": c.schoolID,
+		"INGEST_USER": c.ingestUser, "INGEST_PASSWORD": c.ingestPassword,
+		"S3_ENDPOINT": c.s3Endpoint,
+	} {
+		if v == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		slices.Sort(missing)
+		return fmt.Errorf("not set: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+// GET /file?key=...: downloads file from s3
+func (c *cfg) handleFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, "missing key parameter", http.StatusBadRequest)
+		return
+	}
+
+	if c.s3Client == nil {
+		http.Error(w, "s3 client not configured", http.StatusInternalServerError)
+		return
+	}
+
+	obj, err := c.s3Client.GetObject(r.Context(), c.s3Bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		http.Error(w, "failed to get object from s3: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer obj.Close()
+
+	info, err := obj.Stat()
+	if err != nil {
+		// Check if object exists
+		if errResp, ok := err.(minio.ErrorResponse); ok && errResp.Code == "NoSuchKey" {
+			http.Error(w, "file not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "failed to stat object: "+err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", info.ContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(key)))
+
+	http.ServeContent(w, r, filepath.Base(key), info.LastModified, obj)
 }
 
 func logMiddleware(next http.Handler) http.Handler {
@@ -284,6 +227,17 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envList splits a comma-separated value, dropping empty items.
+func envList(key, def string) []string {
+	var out []string
+	for _, v := range strings.Split(env(key, def), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func envInt64(key string, def int64) int64 {
@@ -302,14 +256,4 @@ func envDur(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
-}
-
-func clampInt(v, lo, hi int) int {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
 }
